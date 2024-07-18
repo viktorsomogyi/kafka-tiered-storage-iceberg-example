@@ -1,0 +1,211 @@
+---
+services:
+
+  # Common minio configuration for Kafka and Iceberg
+  minio:
+    image: minio/minio
+    container_name: minio
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - MINIO_DOMAIN=minio
+    networks:
+      iceberg_net:
+        aliases:
+          - iceberg-warehouse.minio
+          - kafka-remote-storage.minio
+    ports:
+      - 9001:9001
+      - 9000:9000
+    command: [ "server", "/data", "--console-address", ":9001" ]
+
+  # Create Kafka remote storage bucket
+  minio-kafka-create-bucket:
+    depends_on:
+      - minio
+    image: minio/mc
+    container_name: minio-kafka-create-bucket
+    networks:
+      iceberg_net:
+    environment:
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - AWS_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc config host add minio http://minio:9000 minioadmin minioadmin) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc rm -r --force minio/kafka-remote-storage;
+      /usr/bin/mc mb minio/kafka-remote-storage;
+      /usr/bin/mc policy set public minio/kafka-remote-storage;
+      tail -f /dev/null
+      "
+
+  # Kafka with Tiered Storage
+  kafka-1:
+    image: "apache/kafka:3.7.1"
+    container_name: "kafka-ts"
+    depends_on:
+      - minio-kafka-create-bucket
+    networks:
+      iceberg_net:
+    ports:
+      - "9092:9092"
+      - "7000:7000" #prometheus metrics
+    hostname: kafka-1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT_HOST://localhost:9092,PLAINTEXT://kafka-1:19092'
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka-1:29093'
+      KAFKA_LISTENERS: 'CONTROLLER://:29093,PLAINTEXT_HOST://:9092,PLAINTEXT://:19092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      CLUSTER_ID: '4L6g3nShT-eMCtK--X86sw'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      # Tweak retention checking
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 5000 # 5 s
+      KAFKA_LOG_SEGMENT_BYTES: 1048576 # 1 MiB
+      # Enable Tiered Storage
+      KAFKA_REMOTE_LOG_STORAGE_SYSTEM_ENABLE: true # remote.log.storage.system.enable
+      KAFKA_REMOTE_LOG_MANAGER_TASK_INTERVAL_MS: 5000 # 5 s
+      # Remote metadata manager
+      KAFKA_REMOTE_LOG_METADATA_MANAGER_CLASS_NAME: "org.apache.kafka.server.log.remote.metadata.storage.TopicBasedRemoteLogMetadataManager"
+      KAFKA_REMOTE_LOG_METADATA_MANAGER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_RLMM_CONFIG_REMOTE_LOG_METADATA_TOPIC_REPLICATION_FACTOR: 1
+      # Remote storage manager
+      KAFKA_REMOTE_LOG_STORAGE_MANAGER_CLASS_PATH: "/opt/tiered-storage/core/*:/opt/tiered-storage/aws/*"
+      KAFKA_REMOTE_LOG_STORAGE_MANAGER_CLASS_NAME: "io.aiven.kafka.tieredstorage.RemoteStorageManager"
+      KAFKA_RSM_CONFIG_CHUNK_SIZE: 1048576 # 1 MiB
+      KAFKA_RSM_CONFIG_FETCH_CHUNK_CACHE_CLASS: "io.aiven.kafka.tieredstorage.fetch.cache.DiskChunkCache"
+      KAFKA_RSM_CONFIG_FETCH_CHUNK_CACHE_PATH: /tmp/tiered-storage-cache
+      KAFKA_RSM_CONFIG_FETCH_CHUNK_CACHE_SIZE: 104857600 # 100 MiB
+      KAFKA_RSM_CONFIG_FETCH_CHUNK_CACHE_PREFETCH_MAX_SIZE: 4194304 # 4 MiB
+      KAFKA_RSM_CONFIG_FETCH_CHUNK_CACHE_RETENTION_MS: 10000 # 10 s
+      KAFKA_RSM_CONFIG_CUSTOM_METADATA_FIELDS_INCLUDE: "REMOTE_SIZE"
+      # Storage backend
+      KAFKA_RSM_CONFIG_KEY_PREFIX: "tiered-storage-demo/"
+      KAFKA_RSM_CONFIG_STORAGE_BACKEND_CLASS: "io.aiven.kafka.tieredstorage.storage.s3.S3Storage"
+      KAFKA_RSM_CONFIG_STORAGE_S3_ENDPOINT_URL: "http://minio:9000"
+      KAFKA_RSM_CONFIG_STORAGE_S3_BUCKET_NAME: "kafka-remote-storage"
+      KAFKA_RSM_CONFIG_STORAGE_S3_REGION: "us-east-1"
+      KAFKA_RSM_CONFIG_STORAGE_S3_PATH_STYLE_ACCESS_ENABLED: true
+      KAFKA_RSM_CONFIG_STORAGE_AWS_ACCESS_KEY_ID: "minioadmin"
+      KAFKA_RSM_CONFIG_STORAGE_AWS_SECRET_ACCESS_KEY: "minioadmin"
+      CLASSPATH: "/opt/tiered-storage/core/*:/opt/tiered-storage/aws/*"
+    volumes:
+      - ./volumes/tiered-storage/core:/opt/tiered-storage/core
+      - ./volumes/tiered-storage/aws:/opt/tiered-storage/aws
+      - ./volumes/tiered-storage-cache:/tmp/tiered-storage-cache
+
+  # Create Iceberg warehouse bucket
+  minio-iceberg-create-bucket:
+    depends_on:
+      - minio
+    image: minio/mc
+    container_name: minio-iceberg-create-bucket
+    networks:
+      iceberg_net:
+    environment:
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - AWS_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc config host add minio http://minio:9000 minioadmin minioadmin) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc rm -r --force minio/iceberg-warehouse;
+      /usr/bin/mc mb minio/iceberg-warehouse;
+      /usr/bin/mc policy set public minio/iceberg-warehouse;
+      tail -f /dev/null
+      "
+
+  # Iceberg REST API
+  rest:
+    image: tabulario/iceberg-rest
+    container_name: rest
+    networks:
+      iceberg_net:
+    depends_on:
+      - minio-iceberg-create-bucket
+    ports:
+      - 8181:8181
+    environment:
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=s3://iceberg-warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+
+#  spark-iceberg:
+#    image: tabulario/spark-iceberg
+#    container_name: spark-iceberg
+#    build: spark/
+#    networks:
+#      iceberg_net:
+#    depends_on:
+#      - rest
+#      - minio
+#    volumes:
+#      - ./warehouse:/home/iceberg/warehouse
+#      - ./notebooks:/home/iceberg/notebooks/notebooks
+#      - ./build/libs:/build/libs
+#    environment:
+#      - AWS_ACCESS_KEY_ID=minioadmin
+#      - AWS_SECRET_ACCESS_KEY=minioadmin
+#      - AWS_REGION=us-east-1
+#    ports:
+#      - 8888:8888
+#      - 8080:8080
+#      - 10000:10000
+#      - 10001:10001
+
+  sql-client:
+    container_name: sql-client
+    networks:
+      iceberg_net:
+    build:
+      context: .
+      dockerfile: docker/sql-client/Dockerfile
+    depends_on:
+      - jobmanager
+    environment:
+      FLINK_JOBMANAGER_HOST: jobmanager
+
+  jobmanager:
+    image: flink:1.17.1-scala_2.12-java11
+    container_name: jobmanager
+    networks:
+      iceberg_net:
+    depends_on:
+      - kafka-1
+      - rest
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+
+  taskmanager:
+    image: flink:1.17.1-scala_2.12-java11
+    container_name: taskmanager
+    networks:
+      iceberg_net:
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    scale: 1
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 2
+
+networks:
+  iceberg_net:
